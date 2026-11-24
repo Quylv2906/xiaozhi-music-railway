@@ -3889,6 +3889,34 @@ _YT_STOP_WORDS = {
     'cho', 'toi', 'minh', 'giup', 'gium', 'official', 'mv', 'audio', 'video', 'lyrics', 'lyric', 'ft', 'feat'
 }
 
+_youtube_playable_cache = {}
+_youtube_playable_cache_lock = threading.Lock()
+_YOUTUBE_PLAYABLE_TTL = 60 * 60
+
+def _get_cached_playable(query_str):
+    key = _yt_norm(query_str)
+    if not key:
+        return None
+    with _youtube_playable_cache_lock:
+        row = _youtube_playable_cache.get(key)
+        if not row or time.time() - row.get('at', 0) > _YOUTUBE_PLAYABLE_TTL:
+            _youtube_playable_cache.pop(key, None)
+            return None
+        return dict(row)
+
+def _cache_playable(query_str, info):
+    key = _yt_norm(query_str)
+    video_id = str((info or {}).get('id', '') or '')
+    if not key or not video_id:
+        return
+    with _youtube_playable_cache_lock:
+        _youtube_playable_cache[key] = {
+            'at': time.time(),
+            'id': video_id,
+            'title': str(info.get('title', video_id)),
+            'duration': info.get('duration', 0) or 0,
+        }
+
 def _score_youtube_candidates(q_str, entries):
     q_norm = _yt_norm(q_str)
     q_tokens = [w for w in q_norm.split() if w not in _YT_STOP_WORDS and len(w) >= 2]
@@ -4010,9 +4038,90 @@ def select_best_video(query_str, ydl_instance):
         logging.error(f"Error in select_best_video for '{query_str}': {err}")
         return None
 
+def resolve_playable_video(query_str, ydl_instance, preferred_id=None):
+    """Resolve a genuinely playable audio URL, falling back from blocked videos.
+
+    YouTube's flat search can still return geo/owner-blocked videos.  The old
+    bridge returned that ID immediately, so the ESP32 received HTTP 200 from
+    /play and then silence from /stream.  Validate the selected result here and
+    try a title-matched cover only when the normal release is unavailable.
+    """
+    q = (query_str or '').strip()
+    seen_ids = set()
+    attempts = []
+
+    cached = _get_cached_playable(q)
+    if cached and cached.get('id'):
+        attempts.append((str(cached['id']), cached))
+        seen_ids.add(str(cached['id']))
+
+    if preferred_id and str(preferred_id) not in seen_ids:
+        attempts.append((str(preferred_id), None))
+        seen_ids.add(str(preferred_id))
+
+    search_variants = [q]
+    q_norm = _yt_norm(q)
+    if q and not any(word in q_norm.split() for word in ('cover', 'karaoke', 'remix', 'instrumental')):
+        search_variants.append(f"{q} cover")
+
+    flat_opts = {'quiet': True, 'extract_flat': 'in_playlist', 'noplaylist': True}
+    for variant in search_variants:
+        try:
+            with yt_dlp.YoutubeDL(flat_opts) as flat_ydl:
+                result = flat_ydl.extract_info(f"ytsearch8:{variant}", download=False)
+            entries = [entry for entry in (result or {}).get('entries', []) if entry and entry.get('id')]
+            ranked = _score_youtube_candidates(variant, entries)
+            ordered = [row[2] for row in ranked] or entries
+            # The cover query is an availability fallback, not a license to
+            # wander through dozens of unrelated videos.
+            limit = 2 if variant == q else 4
+            for entry in ordered[:limit]:
+                video_id = str(entry.get('id', ''))
+                if not video_id or video_id in seen_ids:
+                    continue
+                seen_ids.add(video_id)
+                attempts.append((video_id, entry))
+        except Exception as err:
+            logging.warning(f"YouTube fallback search failed for '{variant}': {err}")
+
+    for video_id, entry in attempts:
+        try:
+            info = ydl_instance.extract_info(
+                f"https://www.youtube.com/watch?v={video_id}", download=False
+            )
+            if info and info.get('url'):
+                _cache_playable(q, info)
+                if preferred_id and video_id != str(preferred_id):
+                    logging.info(
+                        "YouTube video %s unavailable; fallback selected '%s' (%s)",
+                        preferred_id, info.get('title', video_id), video_id,
+                    )
+                return info
+        except Exception as err:
+            logging.warning("Skipping unavailable YouTube video %s: %s", video_id, err)
+    return None
+
 class YouTubeHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         logging.info("%s - %s", self.address_string(), format % args)
+
+    def do_HEAD(self):
+        """Allow audio players to probe the bridge before opening the stream."""
+        path = urllib.parse.urlparse(self.path).path
+        if path == '/stream':
+            self.send_response(200)
+            self.send_header('Content-Type', 'audio/mpeg')
+            self.send_header('Cache-Control', 'no-cache')
+            self.send_header('Accept-Ranges', 'none')
+            self.send_header('Connection', 'close')
+            self.end_headers()
+            return
+        if path in ('/', '/health'):
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.end_headers()
+            return
+        self.send_error(404, 'Not found')
 
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
@@ -4383,7 +4492,8 @@ class YouTubeHandler(http.server.BaseHTTPRequestHandler):
                 return
             try:
                 logging.info(f"Searching YouTube for: {q}")
-                selected_entry = select_best_video(q, ydl)
+                cached = _get_cached_playable(q)
+                selected_entry = cached or select_best_video(q, ydl)
                 if not selected_entry:
                     self.send_error(404, 'No video found')
                     return
@@ -4395,7 +4505,12 @@ class YouTubeHandler(http.server.BaseHTTPRequestHandler):
                 
                 host = self.headers.get('Host', f'{LAN_IP}:{PORT}')
                 proto = self.headers.get('X-Forwarded-Proto', 'http')
-                stream_url = f"{proto}://{host}/stream?v={video_id}"
+                # Preserve the query so /stream can automatically replace a
+                # search result that becomes unavailable between both calls.
+                stream_url = (
+                    f"{proto}://{host}/stream?v={video_id}"
+                    f"&q={urllib.parse.quote(q)}"
+                )
                 
                 response_data = {
                     'status': 'success',
@@ -4425,19 +4540,11 @@ class YouTubeHandler(http.server.BaseHTTPRequestHandler):
             try:
                 user_agent = None
                 with yt_dlp.YoutubeDL(ydl_search_opts) as ydl_req:
-                    if video_id:
-                        info = ydl_req.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+                    info = resolve_playable_video(q, ydl_req, preferred_id=video_id) if (video_id or q) else None
+                    if info:
                         target_url = info.get('url')
-                        title = info.get('title', video_id)
+                        title = info.get('title', video_id or q)
                         user_agent = (info.get('http_headers') or {}).get('User-Agent')
-                    elif q:
-                        best = select_best_video(q, ydl_req)
-                        if best:
-                            video_id = best.get('id')
-                            info = ydl_req.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
-                            target_url = info.get('url')
-                            title = info.get('title', q)
-                            user_agent = (info.get('http_headers') or {}).get('User-Agent')
 
                 if not target_url:
                     self.send_error(404, 'Could not resolve audio stream')
